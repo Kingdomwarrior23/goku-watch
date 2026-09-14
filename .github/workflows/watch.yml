@@ -1,0 +1,100 @@
+# Uptime heartbeat check. Secrets: HEARTBEAT_URL, HEARTBEAT_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID.
+# One probe per run (+1 retry after 10s); alert after 2 consecutive missed runs; one recovery message.
+# Logs show only OK / HTTP status / miss count. GitHub may delay or skip scheduled runs under load.
+name: watch
+on:
+  workflow_dispatch:
+    inputs:
+      test_no_token:
+        description: 'TEST: probe without the token (expect 401). Dry run: no alert, state not saved.'
+        type: boolean
+        default: false
+      sim_prior_fails:
+        description: 'TEST: earlier consecutive misses to simulate (dry run only)'
+        default: '0'
+      keepalive:
+        description: 'Run the keepalive job'
+        type: boolean
+        default: false
+concurrency:
+  group: watch
+  cancel-in-progress: false
+permissions: {}
+jobs:
+  check:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '*/5 * * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: watch-${{ github.run_id }}
+          restore-keys: watch-
+      - name: Probe
+        env:
+          DRY: ${{ inputs.test_no_token == true && '1' || '' }}
+          SIM_PRIOR_FAILS: ${{ inputs.sim_prior_fails }}
+          HEARTBEAT_URL: ${{ secrets.HEARTBEAT_URL }}
+          HEARTBEAT_TOKEN: ${{ secrets.HEARTBEAT_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          node - <<'EOF'
+          const fs = require('fs');
+          const E = process.env;
+          const dry = E.DRY === '1';
+          const load = () => { try { return JSON.parse(fs.readFileSync('state.json', 'utf8')); } catch { return {}; } };
+          const s = Object.assign({ fails: 0, alerted: false, since: null }, dry ? {} : load());
+          if (dry) s.fails = Math.max(0, parseInt(E.SIM_PRIOR_FAILS || '0', 10) || 0);
+          const tg = async text => {
+            if (dry) { console.log('dry run: alert suppressed'); return true; }
+            try {
+              const r = await fetch(`https://api.telegram.org/bot${E.TELEGRAM_BOT_TOKEN}/sendMessage`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ chat_id: E.TELEGRAM_CHAT_ID, text, disable_web_page_preview: true }), signal: AbortSignal.timeout(15000) });
+              console.log(`notify HTTP ${r.status}`); return r.ok;
+            } catch { console.log('notify failed'); return false; }
+          };
+          const probe = async () => {
+            try {
+              const headers = dry ? {} : { authorization: `Bearer ${E.HEARTBEAT_TOKEN}` };
+              const r = await fetch(E.HEARTBEAT_URL, { headers, signal: AbortSignal.timeout(15000) });
+              const j = await r.json().catch(() => null);
+              if (r.status === 200 && j && j.ok === true) return { ok: true, code: 'HTTP 200' };
+              return { ok: false, code: `HTTP ${r.status}`, detail: r.status !== 200 ? `HTTP ${r.status}` : (j && j.reason) || 'heartbeat said not ok' };
+            } catch (e) { const t = e.name === 'TimeoutError'; return { ok: false, code: t ? 'timeout' : 'unreachable', detail: t ? 'timed out after 15s' : 'unreachable' }; }
+          };
+          (async () => {
+            if (!E.HEARTBEAT_URL) { console.log('config missing'); process.exit(1); }
+            let res = await probe();
+            if (!res.ok) { await new Promise(r => setTimeout(r, 10000)); res = await probe(); }
+            const now = Date.now();
+            if (res.ok) {
+              if (s.alerted) { const m = Math.max(1, Math.round((now - (s.since || now)) / 60000)); await tg(`Goku's back. The dashboard is answering again after about ${m} minute${m === 1 ? '' : 's'}.`); }
+              Object.assign(s, { fails: 0, alerted: false, since: null });
+            } else {
+              s.fails += 1; s.since = s.since || now;
+              if (s.fails >= 2 && !s.alerted) s.alerted = await tg(`Goku has gone quiet. I couldn't reach the dashboard twice in a row (${res.detail}). WSL, the tunnel, or the PC itself is probably down, and nothing inside it can alert you. Worth a look when you can.`);
+            }
+            if (!dry) fs.writeFileSync('state.json', JSON.stringify(s));
+            console.log(`${res.ok ? 'OK' : 'MISS'} ${res.code} misses=${s.fails}${dry ? ' (dry run)' : ''}`);
+          })();
+          EOF
+      - name: Save state
+        if: always() && inputs.test_no_token != true
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: watch-${{ github.run_id }}
+  keepalive:
+    if: github.event.schedule == '17 3 1 * *' || inputs.keepalive == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      actions: write
+    steps:
+      - name: Re-enable this workflow (resets the 60-day inactivity timer)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/watch.yml/enable" --silent && echo "keepalive OK"
