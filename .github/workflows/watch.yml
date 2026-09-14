@@ -3,6 +3,9 @@
 # Logs show only OK / HTTP status / miss count. GitHub may delay or skip scheduled runs under load.
 name: watch
 on:
+  schedule:
+    - cron: '*/5 * * * *'
+    - cron: '17 3 1 * *'   # monthly keepalive (public repos disable schedules after 60 idle days)
   workflow_dispatch:
     inputs:
       test_no_token:
